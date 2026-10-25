@@ -62,9 +62,8 @@ def register(app: typer.Typer, console: Console) -> None:
             None,
             "--prompts",
             help=(
-                "Optional JSONL or plain-text file of prompts (one per line, "
-                "or JSONL rows with a 'prompt' key). "
-                "Defaults to a built-in set of generic probes when absent."
+                "Path to prompts file (JSONL or plain text, one per line). "
+                "Must be provided: give --prompts to specify representative evaluation prompts."
             ),
         ),
         min_agreement: float = typer.Option(
@@ -140,17 +139,23 @@ def register(app: typer.Typer, console: Console) -> None:
             )
             raise typer.Exit(EXIT_USAGE_ERROR)
 
-        if prompts is not None:
-            prompts_path = Path(prompts)
-            if not is_under_cwd(prompts_path):
-                console.print(
-                    f"[red]--prompts '{for_terminal(prompts)}' is outside the "
-                    "current working directory — refusing.[/]"
-                )
-                raise typer.Exit(EXIT_USAGE_ERROR)
-            if not prompts_path.exists():
-                console.print(f"[red]--prompts not found: {for_terminal(prompts)}[/]")
-                raise typer.Exit(EXIT_USAGE_ERROR)
+        if prompts is None:
+            console.print(
+                "[red]Missing required evaluation prompts: give --prompts with a path to "
+                "a JSONL or plain-text prompts file.[/]"
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR)
+
+        prompts_path = Path(prompts)
+        if not is_under_cwd(prompts_path):
+            console.print(
+                f"[red]--prompts '{for_terminal(prompts)}' is outside the "
+                "current working directory — refusing.[/]"
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR)
+        if not prompts_path.exists():
+            console.print(f"[red]--prompts not found: {for_terminal(prompts)}[/]")
+            raise typer.Exit(EXIT_USAGE_ERROR)
 
         # --- Validate exported artifact format ---
         try:
@@ -182,36 +187,34 @@ def register(app: typer.Typer, console: Console) -> None:
             raise typer.Exit(EXIT_USAGE_ERROR)
 
         # --- Load prompts ---
-        prompt_list: Optional[list[str]] = None
-        if prompts is not None:
-            try:
-                prompt_list = load_prompts_file(prompts)
-            except (ValueError, OSError) as exc:
-                console.print(
-                    f"[red]Cannot read --prompts '{for_terminal(prompts)}': "
-                    f"{for_terminal(str(exc))}[/]"
-                )
-                raise typer.Exit(EXIT_USAGE_ERROR) from exc
+        try:
+            prompt_list = load_prompts_file(prompts)
+        except (ValueError, OSError) as exc:
+            console.print(
+                f"[red]Cannot read --prompts '{for_terminal(prompts)}': "
+                f"{for_terminal(str(exc))}[/]"
+            )
+            raise typer.Exit(EXIT_USAGE_ERROR) from exc
 
-        # --- Build generators ---
+        # --- Build evaluators ---
         is_stub = False
-        base_gen = ref_gen = exported_gen = None
+        base_eval = ref_eval = exported_eval = None
 
         try:
             from soup_cli.eval.export_check import (
-                make_hf_adapter_generator,
-                make_hf_generator,
+                make_hf_adapter_evaluator,
+                make_hf_evaluator,
             )
 
             if fmt == "table":
                 console.print("[dim]Loading base model...[/]")
-            base_gen = make_hf_generator(resolved_base)
+            base_eval = make_hf_evaluator(resolved_base)
             if fmt == "table":
                 console.print("[dim]Loading reference model (adapter)...[/]")
-            ref_gen = make_hf_adapter_generator(str(adapter_path), resolved_base)
+            ref_eval = make_hf_adapter_evaluator(str(adapter_path), resolved_base)
             if fmt == "table":
                 console.print("[dim]Loading exported model...[/]")
-            exported_gen = make_hf_generator(str(exported_path))
+            exported_eval = make_hf_evaluator(str(exported_path))
             if fmt == "table":
                 console.print("[green]All three models loaded.[/]\n")
 
@@ -231,16 +234,16 @@ def register(app: typer.Typer, console: Console) -> None:
                     "This does NOT verify real export fidelity and will fail the gate.[/]"
                 )
             is_stub = True
-            base_gen = stub_generator("base")
-            ref_gen = stub_generator("ref")
-            exported_gen = stub_generator("exported")
+            base_eval = stub_generator("base")
+            ref_eval = stub_generator("ref")
+            exported_eval = stub_generator("exported")
 
         # --- Run comparison ---
         try:
             result = run_export_check(
-                base_gen=base_gen,
-                ref_gen=ref_gen,
-                exported_gen=exported_gen,
+                base_gen=base_eval,
+                ref_gen=ref_eval,
+                exported_gen=exported_eval,
                 prompts=prompt_list,
                 min_agreement=min_agreement,
                 stub=is_stub,

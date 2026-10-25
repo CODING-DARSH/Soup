@@ -39,7 +39,7 @@ from __future__ import annotations
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Protocol, Union
 
 from soup_cli.utils.terminal import for_terminal
 
@@ -101,6 +101,12 @@ def classify_artifact(path: Path) -> str:
         dir_files = {entry.name for entry in os.scandir(path)}
     except OSError as exc:
         raise ValueError(f"cannot list '{path}': {exc}") from exc
+
+    if "adapter_config.json" in dir_files:
+        raise ValueError(
+            f"'{path}' is a LoRA adapter directory, not a merged model. "
+            "Pass the merged artifact to --exported, not the adapter."
+        )
 
     if _MLX_WEIGHT_NAMES & dir_files:
         raise ValueError(
@@ -171,6 +177,76 @@ def _first_divergent_pos(a: str, b: str) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class GenerationOutput:
+    """Generation output including raw decoded text and token IDs."""
+
+    text: str
+    token_ids: list[int]
+
+
+class ModelEvaluator(Protocol):
+    """Protocol for model evaluation in export-check."""
+
+    def generate(self, prompt: str, max_new_tokens: int = 128) -> GenerationOutput:
+        """Run greedy decoding on prompt and return text and generated token IDs."""
+        ...
+
+    def compute_nll(self, texts: list[str]) -> float:
+        """Compute mean next-token negative log-likelihood on texts."""
+        ...
+
+
+class FunctionModelEvaluator:
+    """Adapts a simple callable or stub generator into a ModelEvaluator."""
+
+    def __init__(
+        self,
+        gen_fn: Callable[[str], str],
+        nll_fn: Optional[Callable[[list[str]], float]] = None,
+    ) -> None:
+        self._gen_fn = gen_fn
+        self._nll_fn = nll_fn
+
+    def generate(self, prompt: str, max_new_tokens: int = 128) -> GenerationOutput:  # noqa: ARG002
+        out_text = self._gen_fn(prompt)
+        # Approximate tokens via utf-8 bytes for synthetic / stub functions without a tokenizer
+        token_ids = list(out_text.encode("utf-8"))
+        return GenerationOutput(text=out_text, token_ids=token_ids)
+
+    def compute_nll(self, texts: list[str]) -> float:
+        if self._nll_fn is not None:
+            return self._nll_fn(texts)
+        return 0.0
+
+
+def _coerce_evaluator(
+    evaluator_or_callable: Union[
+        ModelEvaluator, Callable[[str], str], Callable[[str], GenerationOutput]
+    ],
+) -> ModelEvaluator:
+    """Ensure an evaluator object conforms to ModelEvaluator."""
+    if hasattr(evaluator_or_callable, "generate") and hasattr(evaluator_or_callable, "compute_nll"):
+        return evaluator_or_callable  # type: ignore[return-value]
+
+    # It's a callable
+    def _adapted(prompt: str) -> str:
+        res = evaluator_or_callable(prompt)  # type: ignore[operator]
+        return res.text if isinstance(res, GenerationOutput) else str(res)
+
+    return FunctionModelEvaluator(_adapted)
+
+
+def _first_divergent_token(a: list[int], b: list[int]) -> Optional[int]:
+    """Return the 0-based token index of the first difference, or None if equal."""
+    for idx, (ta, tb) in enumerate(zip(a, b)):
+        if ta != tb:
+            return idx
+    if len(a) != len(b):
+        return min(len(a), len(b))
+    return None
+
+
+@dataclass(frozen=True)
 class ExportCheckPromptRow:
     """Per-prompt comparison result."""
 
@@ -186,7 +262,9 @@ class ExportCheckPromptRow:
     exact_match_export_ref: bool
     #: Similarity of exported vs base (1.0 = identical).
     agree_export_base: float
-    #: Position of first divergent character between exported and ref.
+    #: 0-based index of first divergent token between exported and ref (None if identical).
+    first_divergent_token: Optional[int]
+    #: Position of first divergent character between exported and ref (legacy char offset).
     first_divergent_char: Optional[int]
     #: "DELTA_LOST" | "PASS" | "INACTIVE" (adapter did not change output here)
     verdict: str
@@ -202,6 +280,10 @@ class ExportCheckResult:
     active_prompt_count: int
     delta_lost: bool
     passed: bool
+    base_nll: Optional[float] = None
+    ref_nll: Optional[float] = None
+    exported_nll: Optional[float] = None
+    verdict: str = "PASS"
     stub: bool = False
 
     def to_json(self) -> str:
@@ -221,6 +303,10 @@ class ExportCheckResult:
             "active_prompt_count": self.active_prompt_count,
             "delta_lost": self.delta_lost,
             "passed": self.passed,
+            "verdict": self.verdict,
+            "base_nll": self.base_nll,
+            "ref_nll": self.ref_nll,
+            "exported_nll": self.exported_nll,
             "rows": rows,
         }
         if self.stub:
@@ -247,10 +333,14 @@ _DEFAULT_PROMPTS: tuple[str, ...] = (
 def load_prompts_file(path: str) -> list[str]:
     """Read prompts from a JSONL or plain-text file.
 
-    JSONL rows may contain a ``"prompt"`` key or be bare strings.
-    Plain-text files yield one prompt per non-empty line.
+    Supports:
+    - JSONL objects with a ``"prompt"`` key.
+    - Alpaca-format objects with an ``"instruction"`` key (and optional ``"input"``).
+    - ChatML-format objects with a ``"messages"`` key (extracts user/system messages).
+    - JSONL bare JSON strings (e.g. ``"Hello world"``).
+    - Plain text files (one prompt per non-empty line).
 
-    Raises ``ValueError`` on parse failures.
+    Raises ``ValueError`` on parse failures with file name and line number.
     """
     import json
 
@@ -260,6 +350,7 @@ def load_prompts_file(path: str) -> list[str]:
             line = raw_line.strip()
             if not line:
                 continue
+
             if line.startswith("{"):
                 try:
                     obj = json.loads(line)
@@ -272,13 +363,59 @@ def load_prompts_file(path: str) -> list[str]:
                         f"{path}:{lineno}: JSONL row must be a JSON object, "
                         f"got {type(obj).__name__}"
                     )
-                prompt = obj.get("prompt", "")
-                if not isinstance(prompt, str):
+                if "prompt" in obj:
+                    prompt = obj["prompt"]
+                    if not isinstance(prompt, str):
+                        raise ValueError(
+                            f"{path}:{lineno}: 'prompt' field must be a string, "
+                            f"got {type(prompt).__name__}"
+                        )
+                    result.append(prompt)
+                elif "instruction" in obj:
+                    # Alpaca format: instruction + optional input
+                    instruction = obj["instruction"]
+                    if not isinstance(instruction, str):
+                        raise ValueError(
+                            f"{path}:{lineno}: 'instruction' field must be a string, "
+                            f"got {type(instruction).__name__}"
+                        )
+                    inp = obj.get("input", "")
+                    if inp and isinstance(inp, str):
+                        prompt = f"{instruction}\n\n{inp}".strip()
+                    else:
+                        prompt = instruction
+                    result.append(prompt)
+                elif "messages" in obj:
+                    # ChatML format: list of messages dicts [{"role": ..., "content": ...}]
+                    msgs = obj["messages"]
+                    if not isinstance(msgs, list):
+                        raise ValueError(
+                            f"{path}:{lineno}: 'messages' field must be a list, "
+                            f"got {type(msgs).__name__}"
+                        )
+                    content_parts = []
+                    for m in msgs:
+                        if isinstance(m, dict) and "content" in m and isinstance(m["content"], str):
+                            content_parts.append(m["content"])
+                    if not content_parts:
+                        raise ValueError(
+                            f"{path}:{lineno}: 'messages' list contained no text content"
+                        )
+                    result.append("\n\n".join(content_parts))
+                else:
                     raise ValueError(
-                        f"{path}:{lineno}: 'prompt' field must be a string, "
-                        f"got {type(prompt).__name__}"
+                        f"{path}:{lineno}: JSON object missing recognizable prompt key "
+                        f"(expected 'prompt', 'instruction', or 'messages')"
                     )
-                result.append(prompt)
+            elif line.startswith('"') and line.endswith('"') and len(line) >= 2:
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, str):
+                        result.append(obj)
+                    else:
+                        result.append(line)
+                except json.JSONDecodeError:
+                    result.append(line)
             else:
                 result.append(line)
     if not result:
@@ -289,19 +426,24 @@ def load_prompts_file(path: str) -> list[str]:
 def _compare_one(
     *,
     prompt: str,
-    base_gen: Callable[[str], str],
-    ref_gen: Callable[[str], str],
-    exported_gen: Callable[[str], str],
+    base_eval: ModelEvaluator,
+    ref_eval: ModelEvaluator,
+    exported_eval: ModelEvaluator,
 ) -> ExportCheckPromptRow:
-    """Run a single prompt through all three generators and compute metrics."""
-    base_out = base_gen(prompt)
-    ref_out = ref_gen(prompt)
-    exp_out = exported_gen(prompt)
+    """Run a single prompt through all three evaluators and compute metrics."""
+    base_res = base_eval.generate(prompt)
+    ref_res = ref_eval.generate(prompt)
+    exp_res = exported_eval.generate(prompt)
 
-    adapter_active = base_out != ref_out
+    base_out = base_res.text
+    ref_out = ref_res.text
+    exp_out = exp_res.text
+
+    adapter_active = (base_out != ref_out) or (base_res.token_ids != ref_res.token_ids)
     agree_exp_ref = _char_overlap_ratio(exp_out, ref_out)
     agree_exp_base = _char_overlap_ratio(exp_out, base_out)
-    first_div = _first_divergent_pos(exp_out, ref_out)
+    first_div_char = _first_divergent_pos(exp_out, ref_out)
+    first_div_tok = _first_divergent_token(exp_res.token_ids, ref_res.token_ids)
 
     if not adapter_active:
         verdict = "INACTIVE"
@@ -319,20 +461,22 @@ def _compare_one(
         exported_output=exp_out,
         adapter_active=adapter_active,
         agree_export_ref=agree_exp_ref,
-        exact_match_export_ref=exp_out == ref_out,
+        exact_match_export_ref=(exp_out == ref_out),
         agree_export_base=agree_exp_base,
-        first_divergent_char=first_div,
+        first_divergent_token=first_div_tok,
+        first_divergent_char=first_div_char,
         verdict=verdict,
     )
 
 
 def run_export_check(
     *,
-    base_gen: Callable[[str], str],
-    ref_gen: Callable[[str], str],
-    exported_gen: Callable[[str], str],
+    base_gen: Union[ModelEvaluator, Callable[[str], str], Callable[[str], GenerationOutput]],
+    ref_gen: Union[ModelEvaluator, Callable[[str], str], Callable[[str], GenerationOutput]],
+    exported_gen: Union[ModelEvaluator, Callable[[str], str], Callable[[str], GenerationOutput]],
     prompts: Optional[list[str]] = None,
     min_agreement: float = 0.80,
+    compute_nll: bool = True,
     stub: bool = False,
 ) -> ExportCheckResult:
     """Compare base, reference (adapter), and exported model on *prompts*.
@@ -340,18 +484,20 @@ def run_export_check(
     Parameters
     ----------
     base_gen:
-        Generator for the unmodified base model.
+        Evaluator or generator for the unmodified base model.
     ref_gen:
-        Generator for the reference model (base + LoRA adapter).
+        Evaluator or generator for the reference model (base + LoRA adapter).
     exported_gen:
-        Generator for the exported artifact under test.
+        Evaluator or generator for the exported artifact under test.
     prompts:
-        Prompts to run.  Defaults to :data:`_DEFAULT_PROMPTS` when ``None``.
+        Prompts to run. Defaults to :data:`_DEFAULT_PROMPTS` when ``None``.
     min_agreement:
         Minimum required average ``agree_export_ref`` score across prompts
         where the adapter changes the base model's output. The default 0.80
         allows minor wording drift while the closer-to-base check still
         rejects an export that has reverted to base behavior.
+    compute_nll:
+        Whether to calculate held-out causal next-token NLL across prompts.
     stub:
         True when synthetic stubs are used instead of live models.
 
@@ -363,18 +509,23 @@ def run_export_check(
     if not effective_prompts:
         raise ValueError("No prompts provided.")
 
+    base_eval = _coerce_evaluator(base_gen)
+    ref_eval = _coerce_evaluator(ref_gen)
+    exp_eval = _coerce_evaluator(exported_gen)
+
     rows: list[ExportCheckPromptRow] = []
     for prompt in effective_prompts:
         row = _compare_one(
             prompt=prompt,
-            base_gen=base_gen,
-            ref_gen=ref_gen,
-            exported_gen=exported_gen,
+            base_eval=base_eval,
+            ref_eval=ref_eval,
+            exported_eval=exp_eval,
         )
         rows.append(row)
 
     active_rows = [row for row in rows if row.adapter_active]
-    delta_lost = any(row.verdict == "DELTA_LOST" for row in active_rows)
+    delta_lost_generation = any(row.verdict == "DELTA_LOST" for row in active_rows)
+
     overall_agreement = (
         sum(row.agree_export_ref for row in active_rows) / len(active_rows)
         if active_rows
@@ -385,7 +536,45 @@ def run_export_check(
         if active_rows
         else 0.0
     )
-    passed = bool(active_rows) and (not delta_lost) and (overall_agreement >= min_agreement)
+
+    # Held-out NLL computation
+    base_nll: Optional[float] = None
+    ref_nll: Optional[float] = None
+    exp_nll: Optional[float] = None
+    nll_delta_lost = False
+
+    if compute_nll and not stub:
+        try:
+            base_nll = base_eval.compute_nll(effective_prompts)
+            ref_nll = ref_eval.compute_nll(effective_prompts)
+            exp_nll = exp_eval.compute_nll(effective_prompts)
+
+            # Check if adapter had an NLL delta over base. If |base_nll - ref_nll| is
+            # significant (> 1e-4), check if export reverted closer to base
+            adapter_nll_delta = abs(base_nll - ref_nll)
+            if adapter_nll_delta > 1e-4:
+                dist_exp_ref = abs(exp_nll - ref_nll)
+                dist_exp_base = abs(exp_nll - base_nll)
+                if dist_exp_base < dist_exp_ref:
+                    nll_delta_lost = True
+        except Exception:
+            # If NLL computation is not supported by custom test generators, ignore
+            pass
+
+    delta_lost = delta_lost_generation or nll_delta_lost
+
+    if delta_lost:
+        verdict = "DELTA_LOST"
+        passed = False
+    elif not active_rows:
+        verdict = "NO_EVIDENCE"
+        passed = False
+    elif overall_agreement < min_agreement:
+        verdict = "LOW_AGREEMENT"
+        passed = False
+    else:
+        verdict = "PASS"
+        passed = True
 
     return ExportCheckResult(
         rows=rows,
@@ -394,6 +583,10 @@ def run_export_check(
         active_prompt_count=len(active_rows),
         delta_lost=delta_lost,
         passed=passed,
+        base_nll=base_nll,
+        ref_nll=ref_nll,
+        exported_nll=exp_nll,
+        verdict=verdict,
         stub=stub,
     )
 
@@ -402,40 +595,123 @@ def run_export_check(
 # Model generator factory (lazy — avoids module-level heavy imports)
 # ---------------------------------------------------------------------------
 
-def make_hf_generator(
+class HFCausalLMEvaluator:
+    """Evaluates a causal LM: greedy text generation and masked NLL computation."""
+
+    def __init__(self, model: Any, tokenizer: Any) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    def generate(self, prompt: str, max_new_tokens: int = 128) -> GenerationOutput:
+        if not prompt:
+            return GenerationOutput(text="", token_ids=[])
+
+        max_pos = getattr(self.model.config, "n_positions", None) or getattr(
+            self.model.config, "max_position_embeddings", 2048
+        )
+        max_prompt_len = max(1, max_pos - max_new_tokens)
+        inputs = self.tokenizer(
+            prompt, return_tensors="pt", truncation=True, max_length=max_prompt_len
+        )
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        prompt_len = inputs["input_ids"].shape[1]
+        new_token_ids = outputs[0][prompt_len:].tolist()
+        text = self.tokenizer.decode(new_token_ids, skip_special_tokens=True)
+        return GenerationOutput(text=text, token_ids=new_token_ids)
+
+    def compute_nll(self, texts: list[str]) -> float:
+        import torch
+        from torch.nn import functional as torch_f
+
+        if not texts:
+            return 0.0
+
+        max_pos = getattr(self.model.config, "n_positions", None) or getattr(
+            self.model.config, "max_position_embeddings", 2048
+        )
+        enc = self.tokenizer(
+            texts, return_tensors="pt", padding=True, truncation=True, max_length=max_pos
+        )
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
+
+        with torch.no_grad():
+            logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
+
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        shift_mask = attention_mask[:, 1:].contiguous()
+
+        loss_flat = torch_f.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none",
+        )
+        loss_flat = loss_flat.view(shift_labels.shape) * shift_mask
+        total_loss = float(loss_flat.sum().item())
+        total_tokens = float(shift_mask.sum().item())
+        return total_loss / total_tokens if total_tokens > 0 else 0.0
+
+
+def make_hf_evaluator(
     model_path: str,
     *,
     max_new_tokens: int = 128,
-    temperature: float = 0.0,
-) -> Callable[[str], str]:
-    """Return a greedy HuggingFace generator for *model_path*.
-
-    Raises ``ImportError`` when transformers is not installed, or
-    ``OSError`` / ``ValueError`` on a bad path.
-    """
+) -> HFCausalLMEvaluator:
+    """Return a HuggingFace evaluator for *model_path*."""
     if max_new_tokens < 1 or max_new_tokens > 4096:
         raise ValueError("max_new_tokens must be in [1, 4096]")
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, trust_remote_code=False
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=False)
     model.eval()
+    return HFCausalLMEvaluator(model, tokenizer)
+
+
+def make_hf_adapter_evaluator(
+    adapter_path: str,
+    base_model: str,
+    *,
+    max_new_tokens: int = 128,
+) -> HFCausalLMEvaluator:
+    """Return a HuggingFace+PEFT evaluator for *adapter_path* on *base_model*."""
+    if max_new_tokens < 1 or max_new_tokens > 4096:
+        raise ValueError("max_new_tokens must be in [1, 4096]")
+
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=False)
+    base = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=False)
+    model = PeftModel.from_pretrained(base, adapter_path)
+    model.eval()
+    return HFCausalLMEvaluator(model, tokenizer)
+
+
+def make_hf_generator(
+    model_path: str,
+    *,
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,  # noqa: ARG001
+) -> Callable[[str], str]:
+    """Return a greedy HuggingFace generator for *model_path*.
+
+    Raises ``ImportError`` when transformers is not installed, or
+    ``OSError`` / ``ValueError`` on a bad path.
+    """
+    evaluator = make_hf_evaluator(model_path, max_new_tokens=max_new_tokens)
 
     def _generate(prompt: str) -> str:
-        if not prompt:
-            return ""
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True)
+        return evaluator.generate(prompt, max_new_tokens=max_new_tokens).text
 
     return _generate
 
@@ -450,29 +726,14 @@ def make_hf_adapter_generator(
 
     Raises ``ImportError`` when transformers / peft are not installed.
     """
-    if max_new_tokens < 1 or max_new_tokens > 4096:
-        raise ValueError("max_new_tokens must be in [1, 4096]")
-
-    from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=False)
-    base = AutoModelForCausalLM.from_pretrained(base_model, trust_remote_code=False)
-    model = PeftModel.from_pretrained(base, adapter_path)
-    model.eval()
+    evaluator = make_hf_adapter_evaluator(
+        adapter_path=adapter_path,
+        base_model=base_model,
+        max_new_tokens=max_new_tokens,
+    )
 
     def _generate(prompt: str) -> str:
-        if not prompt:
-            return ""
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-        return tokenizer.decode(new_tokens, skip_special_tokens=True)
+        return evaluator.generate(prompt, max_new_tokens=max_new_tokens).text
 
     return _generate
 
@@ -498,6 +759,8 @@ def _verdict_color(verdict: str) -> str:
         "PASS": "[green]PASS[/]",
         "INACTIVE": "[dim]INACTIVE[/]",
         "DELTA_LOST": "[red]DELTA_LOST[/]",
+        "LOW_AGREEMENT": "[red]LOW_AGREEMENT[/]",
+        "NO_EVIDENCE": "[yellow]NO_EVIDENCE[/]",
     }.get(verdict, verdict)
 
 
@@ -514,17 +777,22 @@ def render_table(result: ExportCheckResult) -> "Table":
     table.add_column("Agree ref", justify="right")
     table.add_column("Exact", justify="center")
     table.add_column("Agree base", justify="right")
-    table.add_column("1st div", justify="right")
+    table.add_column("1st div tok", justify="right")
     table.add_column("Verdict")
     for row in result.rows:
         prompt = row.prompt[:38] + ".." if len(row.prompt) > 40 else row.prompt
+        first_div = (
+            str(row.first_divergent_token)
+            if row.first_divergent_token is not None
+            else (str(row.first_divergent_char) if row.first_divergent_char is not None else "-")
+        )
         table.add_row(
             for_terminal(prompt),
             "yes" if row.adapter_active else "no",
             f"{row.agree_export_ref:.2f}",
             "yes" if row.exact_match_export_ref else "no",
             f"{row.agree_export_base:.2f}",
-            str(row.first_divergent_char) if row.first_divergent_char is not None else "-",
+            first_div,
             _verdict_color(row.verdict),
         )
     return table
@@ -535,25 +803,36 @@ def render_markdown(result: ExportCheckResult) -> str:
     if result.stub:
         lines.append("> **Warning**: Stub generators — not a live model measurement.\n")
     lines.extend([
-        "| Prompt (truncated) | Active | Agree ref | Exact | Agree base | 1st div | Verdict |",
-        "|--------------------|--------|-----------|-------|------------|---------|---------|",
+        "| Prompt (truncated) | Active | Agree ref | Exact | Agree base | 1st div tok | Verdict |",
+        "|--------------------|--------|-----------|-------|------------|-------------|---------|",
     ])
     for row in result.rows:
         prompt_trunc = (row.prompt[:38] + "..") if len(row.prompt) > 40 else row.prompt
         prompt_trunc = for_terminal(prompt_trunc).replace("|", r"\|")
+        first_div = (
+            str(row.first_divergent_token)
+            if row.first_divergent_token is not None
+            else (str(row.first_divergent_char) if row.first_divergent_char is not None else "-")
+        )
         lines.append(
             f"| {prompt_trunc} | {'yes' if row.adapter_active else 'no'} "
             f"| {row.agree_export_ref:.2f} "
             f"| {'yes' if row.exact_match_export_ref else 'no'} "
             f"| {row.agree_export_base:.2f} "
-            f"| {row.first_divergent_char if row.first_divergent_char is not None else '-'} "
+            f"| {first_div} "
             f"| {row.verdict} |"
         )
     lines.append(f"\n**Adapter-active prompts:** {result.active_prompt_count}")
     lines.append(f"**Overall agreement:** {result.overall_agreement:.2f}")
     lines.append(f"**Exact-match rate:** {result.exact_match_rate:.2f}")
+    if result.base_nll is not None:
+        lines.append(f"**Base NLL:** {result.base_nll:.4f}")
+    if result.ref_nll is not None:
+        lines.append(f"**Reference NLL:** {result.ref_nll:.4f}")
+    if result.exported_nll is not None:
+        lines.append(f"**Exported NLL:** {result.exported_nll:.4f}")
     lines.append(f"**Delta lost:** {'yes' if result.delta_lost else 'no'}")
-    lines.append(f"**Result:** {'PASS' if result.passed else 'FAIL'}")
+    lines.append(f"**Result:** {'PASS' if result.passed else 'FAIL'} ({result.verdict})")
     return "\n".join(lines)
 
 

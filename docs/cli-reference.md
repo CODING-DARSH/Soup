@@ -2207,7 +2207,7 @@ Usage: `soup eval export-check [OPTIONS]`
 | `--adapter` | text |  | yes | Path to the LoRA adapter directory used as the reference. Its base model is auto-detected from adapter_config.json unless --base is supplied. |
 | `--exported` | text |  | yes | Path to the exported artifact to test — a merged safetensors directory (from 'soup merge'). Standalone GGUF, ONNX, and MLX fused directories are refused with a diagnostic. |
 | `--base` | text |  |  | Base model path or HuggingFace Hub id. Auto-detected from adapter_config.json when absent. |
-| `--prompts` | text |  |  | Optional JSONL or plain-text file of prompts (one per line, or JSONL rows with a 'prompt' key). Defaults to a built-in set of generic probes when absent. |
+| `--prompts` | text |  |  | Path to prompts file (JSONL or plain text, one per line). Must be provided: give --prompts to specify representative evaluation prompts. |
 | `--min-agreement` | float, 0.0 to 1.0 | `0.8` |  | Minimum required average character-overlap agreement between the exported model and adapter reference on prompts where the adapter changes behavior. Range \[0.0, 1.0]. Default 0.80. |
 | `--format` | text | `table` |  | Output format: table \| json \| markdown |
 | `--allow-stub` | flag | off |  | Use deterministic stub generators if live model loading fails (for CI smoke-testing only; stubs do not verify fidelity and fail the gate). |

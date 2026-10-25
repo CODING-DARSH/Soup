@@ -8,6 +8,7 @@ causes the adapter delta to be lost (reverting to base behavior).
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import patch
 
 import pytest
@@ -15,8 +16,10 @@ from typer.testing import CliRunner
 
 from soup_cli.cli import app
 from soup_cli.eval.export_check import (
+    FunctionModelEvaluator,
     _char_overlap_ratio,
     _first_divergent_pos,
+    _first_divergent_token,
     classify_artifact,
     load_prompts_file,
     render,
@@ -28,6 +31,13 @@ from soup_cli.utils.exit_codes import (
     EXIT_RUNTIME_ERROR,
     EXIT_USAGE_ERROR,
 )
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
 
 runner = CliRunner()
 
@@ -91,6 +101,14 @@ class TestClassifyArtifact:
         with pytest.raises(ValueError, match="no \\*\\.safetensors or \\*\\.bin"):
             classify_artifact(empty_dir)
 
+    def test_classify_refuses_adapter_directory(self, tmp_path):
+        adapter_dir = tmp_path / "adapter_dir"
+        adapter_dir.mkdir()
+        (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+        (adapter_dir / "adapter_model.safetensors").write_bytes(b"dummy")
+        with pytest.raises(ValueError, match="is a LoRA adapter directory"):
+            classify_artifact(adapter_dir)
+
 
 # ---------------------------------------------------------------------------
 # Unit tests: Prompts file loader
@@ -110,6 +128,31 @@ class TestLoadPromptsFile:
             encoding="utf-8",
         )
         assert load_prompts_file(str(p_file)) == ["Prompt 1", "Prompt 2"]
+
+    def test_load_alpaca_format(self, tmp_path):
+        p_file = tmp_path / "alpaca.jsonl"
+        p_file.write_text(
+            json.dumps({"instruction": "Summarize", "input": "text here"}) + "\n" +
+            json.dumps({"instruction": "Translate"}) + "\n",
+            encoding="utf-8",
+        )
+        assert load_prompts_file(str(p_file)) == ["Summarize\n\ntext here", "Translate"]
+
+    def test_load_chatml_format(self, tmp_path):
+        p_file = tmp_path / "chatml.jsonl"
+        msg_payload = {
+            "messages": [
+                {"role": "system", "content": "You are helpful"},
+                {"role": "user", "content": "Hello"},
+            ]
+        }
+        p_file.write_text(json.dumps(msg_payload) + "\n", encoding="utf-8")
+        assert load_prompts_file(str(p_file)) == ["You are helpful\n\nHello"]
+
+    def test_load_bare_json_strings(self, tmp_path):
+        p_file = tmp_path / "strings.jsonl"
+        p_file.write_text('"Hello world"\n"Second prompt"\n', encoding="utf-8")
+        assert load_prompts_file(str(p_file)) == ["Hello world", "Second prompt"]
 
     def test_load_empty_raises(self, tmp_path):
         p_file = tmp_path / "empty.txt"
@@ -218,26 +261,27 @@ class TestRunExportCheck:
         assert result.exact_match_rate == 1.0
         assert result.active_prompt_count == 1
 
-    def test_low_agreement_fails(self):
-        def base_gen(_prompt: str) -> str:
-            return "base response"
+    def test_divergent_token_index(self):
+        assert _first_divergent_token([1, 2, 3], [1, 2, 3]) is None
+        assert _first_divergent_token([1, 2, 4], [1, 2, 5]) == 2
+        assert _first_divergent_token([1, 2], [1, 2, 3]) == 2
+        assert _first_divergent_token([1, 2, 3], [1, 2]) == 2
 
-        def ref_gen(_prompt: str) -> str:
-            return "adapted response"
-
-        def exported_gen(_prompt: str) -> str:
-            return "completely unrecognised gibberish"
-
+    def test_weak_delta_caught_despite_high_character_agreement(self):
+        # Base: "a large city"
+        # Ref (adapter): "a big city"
+        # Exported: "a large city" (delta completely lost, reverted to base)
+        # Bigram overlap between "a large city" and "a big city" is relatively high (~0.6-0.8),
+        # but because exported is closer to base than to ref, it must be flagged as DELTA_LOST!
         result = run_export_check(
-            base_gen=base_gen,
-            ref_gen=ref_gen,
-            exported_gen=exported_gen,
-            prompts=["test prompt"],
-            min_agreement=0.80,
+            base_gen=lambda _p: "a large city",
+            ref_gen=lambda _p: "a big city",
+            exported_gen=lambda _p: "a large city",
+            prompts=["Describe New York:"],
         )
-        assert not result.passed
-        assert not result.delta_lost
-        assert result.overall_agreement < 0.80
+        assert result.delta_lost is True
+        assert result.passed is False
+        assert result.verdict == "DELTA_LOST"
 
 
 class TestJSONTerminalSafety:
@@ -328,25 +372,31 @@ class TestExportCheckCLI:
         )
         gguf_file = tmp_path / "model.gguf"
         gguf_file.write_bytes(b"dummy")
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
 
         result = runner.invoke(app, [
             "eval", "export-check",
             "--adapter", str(adapter_dir),
             "--exported", str(gguf_file),
+            "--prompts", str(prompts),
         ])
         assert result.exit_code == EXIT_USAGE_ERROR
-        assert "standalone GGUF" in result.output
+        assert "standalone GGUF" in _strip_ansi(result.output)
 
     def test_cli_unsupported_format_path_with_markup_is_safe(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         adapter_dir, _ = self._setup_dirs(tmp_path)
         gguf_file = tmp_path / "model[bold].gguf"
         gguf_file.write_bytes(b"dummy")
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
 
         result = runner.invoke(app, [
             "eval", "export-check",
             "--adapter", str(adapter_dir),
             "--exported", str(gguf_file),
+            "--prompts", str(prompts),
         ])
         assert result.exit_code == EXIT_USAGE_ERROR
         assert isinstance(result.exception, SystemExit)
@@ -354,31 +404,37 @@ class TestExportCheckCLI:
     def test_cli_load_error_exits_runtime_error_without_stub(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
         monkeypatch.setattr(
-            "soup_cli.eval.export_check.make_hf_generator",
-            lambda _path: (_ for _ in ()).throw(OSError("model unavailable")),
+            "soup_cli.eval.export_check.make_hf_evaluator",
+            lambda _path, **kwargs: (_ for _ in ()).throw(OSError("model unavailable")),
         )
 
         result = runner.invoke(app, [
             "eval", "export-check",
             "--adapter", str(adapter_dir),
             "--exported", str(exported_dir),
+            "--prompts", str(prompts),
         ])
         assert result.exit_code == EXIT_RUNTIME_ERROR
-        assert "Failed to load models" in result.output
+        assert "Failed to load models" in _strip_ansi(result.output)
 
-    def test_cli_allow_stub_passes_gate(self, tmp_path, monkeypatch):
+    def test_cli_allow_stub_fails_gate_with_code_2(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
         monkeypatch.setattr(
-            "soup_cli.eval.export_check.make_hf_generator",
-            lambda _path: (_ for _ in ()).throw(OSError("model unavailable")),
+            "soup_cli.eval.export_check.make_hf_evaluator",
+            lambda _path, **kwargs: (_ for _ in ()).throw(OSError("model unavailable")),
         )
 
         result = runner.invoke(app, [
             "eval", "export-check",
             "--adapter", str(adapter_dir),
             "--exported", str(exported_dir),
+            "--prompts", str(prompts),
             "--allow-stub",
         ])
         assert result.exit_code == EXIT_GATE_FAILED
@@ -386,19 +442,22 @@ class TestExportCheckCLI:
     def test_cli_with_mocked_intact_generators_passes(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
 
-        with patch("soup_cli.eval.export_check.make_hf_generator") as mock_hf_gen, \
-             patch("soup_cli.eval.export_check.make_hf_adapter_generator") as mock_ref_gen:
-            mock_hf_gen.side_effect = [
-                lambda _p: "base",      # base model
-                lambda _p: "adapter",   # exported model matches adapter
+        with patch("soup_cli.eval.export_check.make_hf_evaluator") as mock_hf_eval, \
+             patch("soup_cli.eval.export_check.make_hf_adapter_evaluator") as mock_ref_eval:
+            mock_hf_eval.side_effect = [
+                FunctionModelEvaluator(lambda _p: "base"),      # base model
+                FunctionModelEvaluator(lambda _p: "adapter"),   # exported model matches adapter
             ]
-            mock_ref_gen.return_value = lambda _p: "adapter"
+            mock_ref_eval.return_value = FunctionModelEvaluator(lambda _p: "adapter")
 
             result = runner.invoke(app, [
                 "eval", "export-check",
                 "--adapter", str(adapter_dir),
                 "--exported", str(exported_dir),
+                "--prompts", str(prompts),
                 "--format", "json",
             ])
             assert result.exit_code == EXIT_OK
@@ -409,22 +468,73 @@ class TestExportCheckCLI:
     def test_cli_with_mocked_destroyed_delta_fails_gate(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
 
-        with patch("soup_cli.eval.export_check.make_hf_generator") as mock_hf_gen, \
-             patch("soup_cli.eval.export_check.make_hf_adapter_generator") as mock_ref_gen:
-            mock_hf_gen.side_effect = [
-                lambda _p: "base response",  # base model
-                lambda _p: "base response",  # exported model lost delta and reverted to base
+        with patch("soup_cli.eval.export_check.make_hf_evaluator") as mock_hf_eval, \
+             patch("soup_cli.eval.export_check.make_hf_adapter_evaluator") as mock_ref_eval:
+            mock_hf_eval.side_effect = [
+                FunctionModelEvaluator(lambda _p: "base response"),  # base model
+                FunctionModelEvaluator(
+                    lambda _p: "base response"
+                ),  # exported model lost delta and reverted to base
             ]
-            mock_ref_gen.return_value = lambda _p: "adapted response"
+            mock_ref_eval.return_value = FunctionModelEvaluator(lambda _p: "adapted response")
 
             result = runner.invoke(app, [
                 "eval", "export-check",
                 "--adapter", str(adapter_dir),
                 "--exported", str(exported_dir),
+                "--prompts", str(prompts),
                 "--format", "json",
             ])
             assert result.exit_code == EXIT_GATE_FAILED
             data = json.loads(result.output)
             assert data["passed"] is False
             assert data["delta_lost"] is True
+
+
+# ---------------------------------------------------------------------------
+# Offline Tiny-Model Integration Tests (tests._tiny_hf_models)
+# ---------------------------------------------------------------------------
+
+class TestTinyModelOfflineIntegration:
+    """Uses real PyTorch/Transformers models and tokenizers locally without Hub access."""
+
+    def test_tiny_model_evaluator_generate_and_nll(self):
+        from soup_cli.eval.export_check import make_hf_evaluator
+        from tests._tiny_hf_models import tiny_model_dir
+
+        model_dir = tiny_model_dir("gpt2")
+        evaluator = make_hf_evaluator(model_dir, max_new_tokens=5)
+
+        # Greedy generation
+        res = evaluator.generate("hello world", max_new_tokens=5)
+        assert isinstance(res.text, str)
+        assert isinstance(res.token_ids, list)
+        assert len(res.token_ids) <= 5
+
+        # Causal NLL computation
+        nll = evaluator.compute_nll(["hello world", "the quick brown fox"])
+        assert isinstance(nll, float)
+        assert nll > 0.0
+
+    def test_run_export_check_with_tiny_models(self):
+        from soup_cli.eval.export_check import make_hf_evaluator, run_export_check
+        from tests._tiny_hf_models import tiny_model_dir
+
+        model_dir = tiny_model_dir("gpt2")
+        evaluator = make_hf_evaluator(model_dir, max_new_tokens=5)
+
+        # Base and reference identical -> INACTIVE, NO_EVIDENCE
+        result = run_export_check(
+            base_gen=evaluator,
+            ref_gen=evaluator,
+            exported_gen=evaluator,
+            prompts=["hi there", "hello world"],
+        )
+        assert result.verdict == "NO_EVIDENCE"
+        assert result.passed is False
+        assert result.base_nll is not None
+        assert result.ref_nll is not None
+        assert result.exported_nll is not None
