@@ -24,6 +24,7 @@ from soup_cli.eval.export_check import (
     load_prompts_file,
     render,
     run_export_check,
+    run_export_check_from_factories,
 )
 from soup_cli.utils.exit_codes import (
     EXIT_GATE_FAILED,
@@ -538,3 +539,90 @@ class TestTinyModelOfflineIntegration:
         assert result.base_nll is not None
         assert result.ref_nll is not None
         assert result.exported_nll is not None
+
+
+# ---------------------------------------------------------------------------
+# Sequential loading regression tests
+# ---------------------------------------------------------------------------
+
+class TestSequentialLoading:
+    """Verify that run_export_check_from_factories loads one model at a time."""
+
+    def test_factories_called_exactly_once_each_in_order(self):
+        """Each factory must be called exactly once and in base → ref → exported order."""
+        call_log: list[str] = []
+
+        def make_factory(label: str, output: str):
+            def factory():
+                call_log.append(f"load:{label}")
+                return FunctionModelEvaluator(lambda _p, o=output: o)
+            return factory
+
+        result = run_export_check_from_factories(
+            base_factory=make_factory("base", "base output"),
+            ref_factory=make_factory("ref", "adapter output"),
+            exported_factory=make_factory("exp", "adapter output"),
+            prompts=["p1", "p2"],
+        )
+        assert call_log == ["load:base", "load:ref", "load:exp"]
+        assert result.passed
+        assert not result.delta_lost
+
+    def test_sequential_intact_delta_passes(self):
+        result = run_export_check_from_factories(
+            base_factory=lambda: FunctionModelEvaluator(lambda _p: "base response"),
+            ref_factory=lambda: FunctionModelEvaluator(lambda _p: "adapted response"),
+            exported_factory=lambda: FunctionModelEvaluator(lambda _p: "adapted response"),
+            prompts=["test prompt 1", "test prompt 2"],
+            min_agreement=0.80,
+        )
+        assert result.passed
+        assert not result.delta_lost
+        assert result.overall_agreement == 1.0
+        assert result.exact_match_rate == 1.0
+
+    def test_sequential_destroyed_delta_fails(self):
+        result = run_export_check_from_factories(
+            base_factory=lambda: FunctionModelEvaluator(lambda _p: "base response"),
+            ref_factory=lambda: FunctionModelEvaluator(lambda _p: "adapted response"),
+            exported_factory=lambda: FunctionModelEvaluator(lambda _p: "base response"),
+            prompts=["test prompt 1"],
+            min_agreement=0.80,
+        )
+        assert not result.passed
+        assert result.delta_lost
+        assert result.verdict == "DELTA_LOST"
+
+    def test_sequential_no_evidence_verdict(self):
+        result = run_export_check_from_factories(
+            base_factory=lambda: FunctionModelEvaluator(lambda _p: "same response"),
+            ref_factory=lambda: FunctionModelEvaluator(lambda _p: "same response"),
+            exported_factory=lambda: FunctionModelEvaluator(lambda _p: "same response"),
+            prompts=["test prompt"],
+        )
+        assert not result.passed
+        assert result.verdict == "NO_EVIDENCE"
+        assert result.active_prompt_count == 0
+
+    def test_sequential_nll_computed_per_model(self):
+        """When factories provide NLL-capable evaluators, all three NLL values are populated."""
+        nll_values = {"base": 1.0, "ref": 0.5, "exp": 0.5}
+
+        def make_nll_factory(label: str, gen_out: str):
+            def factory():
+                return FunctionModelEvaluator(
+                    lambda _p, o=gen_out: o,
+                    nll_fn=lambda _texts: nll_values[label],
+                )
+            return factory
+
+        result = run_export_check_from_factories(
+            base_factory=make_nll_factory("base", "base out"),
+            ref_factory=make_nll_factory("ref", "ref out"),
+            exported_factory=make_nll_factory("exp", "ref out"),
+            prompts=["p1"],
+        )
+        assert result.base_nll == 1.0
+        assert result.ref_nll == 0.5
+        assert result.exported_nll == 0.5
+        assert result.passed

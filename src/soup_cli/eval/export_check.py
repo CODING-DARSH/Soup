@@ -469,6 +469,206 @@ def _compare_one(
     )
 
 
+def _aggregate_rows_and_nll(
+    *,
+    prompts: list[str],
+    base_outputs: list[GenerationOutput],
+    ref_outputs: list[GenerationOutput],
+    exp_outputs: list[GenerationOutput],
+    base_nll_val: Optional[float],
+    ref_nll_val: Optional[float],
+    exp_nll_val: Optional[float],
+    min_agreement: float,
+    stub: bool,
+) -> ExportCheckResult:
+    """Shared aggregation logic used by run_export_check and
+    run_export_check_from_factories.
+    """
+    rows: list[ExportCheckPromptRow] = []
+    for prompt, base_res, ref_res, exp_res in zip(prompts, base_outputs, ref_outputs, exp_outputs):
+        base_out = base_res.text
+        ref_out = ref_res.text
+        exp_out = exp_res.text
+
+        adapter_active = (base_out != ref_out) or (base_res.token_ids != ref_res.token_ids)
+        agree_exp_ref = _char_overlap_ratio(exp_out, ref_out)
+        agree_exp_base = _char_overlap_ratio(exp_out, base_out)
+        first_div_char = _first_divergent_pos(exp_out, ref_out)
+        first_div_tok = _first_divergent_token(exp_res.token_ids, ref_res.token_ids)
+
+        if not adapter_active:
+            row_verdict = "INACTIVE"
+        elif agree_exp_ref >= agree_exp_base:
+            row_verdict = "PASS"
+        else:
+            row_verdict = "DELTA_LOST"
+
+        rows.append(ExportCheckPromptRow(
+            prompt=prompt,
+            base_output=base_out,
+            ref_output=ref_out,
+            exported_output=exp_out,
+            adapter_active=adapter_active,
+            agree_export_ref=agree_exp_ref,
+            exact_match_export_ref=(exp_out == ref_out),
+            agree_export_base=agree_exp_base,
+            first_divergent_token=first_div_tok,
+            first_divergent_char=first_div_char,
+            verdict=row_verdict,
+        ))
+
+    active_rows = [row for row in rows if row.adapter_active]
+    delta_lost_generation = any(row.verdict == "DELTA_LOST" for row in active_rows)
+
+    overall_agreement = (
+        sum(row.agree_export_ref for row in active_rows) / len(active_rows)
+        if active_rows
+        else 0.0
+    )
+    exact_match_rate = (
+        sum(row.exact_match_export_ref for row in active_rows) / len(active_rows)
+        if active_rows
+        else 0.0
+    )
+
+    nll_delta_lost = False
+    all_nlls_present = (
+        base_nll_val is not None and ref_nll_val is not None and exp_nll_val is not None
+    )
+    if not stub and all_nlls_present:
+        adapter_nll_delta = abs(base_nll_val - ref_nll_val)  # type: ignore[operator]
+        if adapter_nll_delta > 1e-4:
+            dist_exp_ref = abs(exp_nll_val - ref_nll_val)  # type: ignore[operator]
+            dist_exp_base = abs(exp_nll_val - base_nll_val)  # type: ignore[operator]
+            if dist_exp_base < dist_exp_ref:
+                nll_delta_lost = True
+
+    delta_lost = delta_lost_generation or nll_delta_lost
+
+    if delta_lost:
+        verdict = "DELTA_LOST"
+        passed = False
+    elif not active_rows:
+        verdict = "NO_EVIDENCE"
+        passed = False
+    elif overall_agreement < min_agreement:
+        verdict = "LOW_AGREEMENT"
+        passed = False
+    else:
+        verdict = "PASS"
+        passed = True
+
+    return ExportCheckResult(
+        rows=rows,
+        overall_agreement=overall_agreement,
+        exact_match_rate=exact_match_rate,
+        active_prompt_count=len(active_rows),
+        delta_lost=delta_lost,
+        passed=passed,
+        base_nll=base_nll_val,
+        ref_nll=ref_nll_val,
+        exported_nll=exp_nll_val,
+        verdict=verdict,
+        stub=stub,
+    )
+
+
+# Type alias for a model factory callable.
+ModelFactory = Callable[[], ModelEvaluator]
+
+
+def run_export_check_from_factories(
+    *,
+    base_factory: ModelFactory,
+    ref_factory: ModelFactory,
+    exported_factory: ModelFactory,
+    prompts: Optional[list[str]] = None,
+    min_agreement: float = 0.80,
+    compute_nll: bool = True,
+    stub: bool = False,
+) -> ExportCheckResult:
+    """Load, evaluate, and unload each model sequentially to avoid concurrent memory use.
+
+    Each factory is called exactly once.  The model it returns is used for
+    all prompts, then explicitly released before the next factory is called.
+    This keeps only one model in memory at a time.
+
+    Parameters
+    ----------
+    base_factory:
+        Zero-argument callable that loads and returns the base ModelEvaluator.
+    ref_factory:
+        Zero-argument callable that loads and returns the reference (adapter) ModelEvaluator.
+    exported_factory:
+        Zero-argument callable that loads and returns the exported ModelEvaluator.
+    prompts:
+        Prompts to run. Defaults to :data:`_DEFAULT_PROMPTS` when ``None``.
+    min_agreement:
+        Minimum required average ``agree_export_ref`` score across active prompts.
+    compute_nll:
+        Whether to calculate held-out causal next-token NLL across prompts.
+    stub:
+        True when synthetic stubs are used instead of live models.
+
+    Returns
+    -------
+    ExportCheckResult
+    """
+    import gc
+
+    effective_prompts = prompts if prompts is not None else list(_DEFAULT_PROMPTS)
+    if not effective_prompts:
+        raise ValueError("No prompts provided.")
+
+    # --- Pass 1: base model ---
+    base_eval = base_factory()
+    base_outputs = [base_eval.generate(p) for p in effective_prompts]
+    base_nll_val: Optional[float] = None
+    if compute_nll and not stub:
+        try:
+            base_nll_val = base_eval.compute_nll(effective_prompts)
+        except Exception:  # noqa: BLE001
+            pass
+    del base_eval
+    gc.collect()
+
+    # --- Pass 2: reference (adapter) model ---
+    ref_eval = ref_factory()
+    ref_outputs = [ref_eval.generate(p) for p in effective_prompts]
+    ref_nll_val: Optional[float] = None
+    if compute_nll and not stub:
+        try:
+            ref_nll_val = ref_eval.compute_nll(effective_prompts)
+        except Exception:  # noqa: BLE001
+            pass
+    del ref_eval
+    gc.collect()
+
+    # --- Pass 3: exported model ---
+    exp_eval = exported_factory()
+    exp_outputs = [exp_eval.generate(p) for p in effective_prompts]
+    exp_nll_val: Optional[float] = None
+    if compute_nll and not stub:
+        try:
+            exp_nll_val = exp_eval.compute_nll(effective_prompts)
+        except Exception:  # noqa: BLE001
+            pass
+    del exp_eval
+    gc.collect()
+
+    return _aggregate_rows_and_nll(
+        prompts=effective_prompts,
+        base_outputs=base_outputs,
+        ref_outputs=ref_outputs,
+        exp_outputs=exp_outputs,
+        base_nll_val=base_nll_val,
+        ref_nll_val=ref_nll_val,
+        exp_nll_val=exp_nll_val,
+        min_agreement=min_agreement,
+        stub=stub,
+    )
+
+
 def run_export_check(
     *,
     base_gen: Union[ModelEvaluator, Callable[[str], str], Callable[[str], GenerationOutput]],
@@ -513,80 +713,32 @@ def run_export_check(
     ref_eval = _coerce_evaluator(ref_gen)
     exp_eval = _coerce_evaluator(exported_gen)
 
-    rows: list[ExportCheckPromptRow] = []
-    for prompt in effective_prompts:
-        row = _compare_one(
-            prompt=prompt,
-            base_eval=base_eval,
-            ref_eval=ref_eval,
-            exported_eval=exp_eval,
-        )
-        rows.append(row)
+    base_outputs = [base_eval.generate(p) for p in effective_prompts]
+    ref_outputs = [ref_eval.generate(p) for p in effective_prompts]
+    exp_outputs = [exp_eval.generate(p) for p in effective_prompts]
 
-    active_rows = [row for row in rows if row.adapter_active]
-    delta_lost_generation = any(row.verdict == "DELTA_LOST" for row in active_rows)
-
-    overall_agreement = (
-        sum(row.agree_export_ref for row in active_rows) / len(active_rows)
-        if active_rows
-        else 0.0
-    )
-    exact_match_rate = (
-        sum(row.exact_match_export_ref for row in active_rows) / len(active_rows)
-        if active_rows
-        else 0.0
-    )
-
-    # Held-out NLL computation
-    base_nll: Optional[float] = None
-    ref_nll: Optional[float] = None
-    exp_nll: Optional[float] = None
-    nll_delta_lost = False
-
+    # Held-out NLL computation (all three evaluators are still in scope here)
+    base_nll_val: Optional[float] = None
+    ref_nll_val: Optional[float] = None
+    exp_nll_val: Optional[float] = None
     if compute_nll and not stub:
         try:
-            base_nll = base_eval.compute_nll(effective_prompts)
-            ref_nll = ref_eval.compute_nll(effective_prompts)
-            exp_nll = exp_eval.compute_nll(effective_prompts)
-
-            # Check if adapter had an NLL delta over base. If |base_nll - ref_nll| is
-            # significant (> 1e-4), check if export reverted closer to base
-            adapter_nll_delta = abs(base_nll - ref_nll)
-            if adapter_nll_delta > 1e-4:
-                dist_exp_ref = abs(exp_nll - ref_nll)
-                dist_exp_base = abs(exp_nll - base_nll)
-                if dist_exp_base < dist_exp_ref:
-                    nll_delta_lost = True
-        except Exception:
+            base_nll_val = base_eval.compute_nll(effective_prompts)
+            ref_nll_val = ref_eval.compute_nll(effective_prompts)
+            exp_nll_val = exp_eval.compute_nll(effective_prompts)
+        except Exception:  # noqa: BLE001
             # If NLL computation is not supported by custom test generators, ignore
             pass
 
-    delta_lost = delta_lost_generation or nll_delta_lost
-
-    if delta_lost:
-        verdict = "DELTA_LOST"
-        passed = False
-    elif not active_rows:
-        verdict = "NO_EVIDENCE"
-        passed = False
-    elif overall_agreement < min_agreement:
-        verdict = "LOW_AGREEMENT"
-        passed = False
-    else:
-        verdict = "PASS"
-        passed = True
-
-    return ExportCheckResult(
-        rows=rows,
-        overall_agreement=overall_agreement,
-        exact_match_rate=exact_match_rate,
-        active_prompt_count=len(active_rows),
-        delta_lost=delta_lost,
-        passed=passed,
-        base_nll=base_nll,
-        ref_nll=ref_nll,
-        exported_nll=exp_nll,
-        verdict=verdict,
+    return _aggregate_rows_and_nll(
+        prompts=effective_prompts,
+        base_outputs=base_outputs,
+        ref_outputs=ref_outputs,
+        exp_outputs=exp_outputs,
+        base_nll_val=base_nll_val,
+        ref_nll_val=ref_nll_val,
+        exp_nll_val=exp_nll_val,
+        min_agreement=min_agreement,
         stub=stub,
     )
 

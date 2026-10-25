@@ -103,7 +103,6 @@ def register(app: typer.Typer, console: Console) -> None:
             ensure_format,
             load_prompts_file,
             render,
-            run_export_check,
             stub_generator,
         )
         from soup_cli.utils.paths import is_under_cwd
@@ -196,29 +195,96 @@ def register(app: typer.Typer, console: Console) -> None:
             )
             raise typer.Exit(EXIT_USAGE_ERROR) from exc
 
-        # --- Build evaluators ---
+        # --- Probe model loading once to catch errors before sequential evaluation ---
         is_stub = False
-        base_eval = ref_eval = exported_eval = None
+        _probe_error: Optional[Exception] = None
 
         try:
-            from soup_cli.eval.export_check import (
+            from soup_cli.eval.export_check import (  # noqa: F401 – import probe only
                 make_hf_adapter_evaluator,
                 make_hf_evaluator,
             )
+        except ImportError as exc:
+            _probe_error = exc
 
+        if _probe_error is not None:
+            if not allow_stub:
+                console.print(
+                    f"[red]Failed to load models: {for_terminal(str(_probe_error))}\n"
+                    "Pass --allow-stub to exercise rendering with deterministic stubs "
+                    "(stubs always fail; they do not verify real fidelity).[/]"
+                )
+                raise typer.Exit(EXIT_RUNTIME_ERROR) from _probe_error
             if fmt == "table":
-                console.print("[dim]Loading base model...[/]")
-            base_eval = make_hf_evaluator(resolved_base)
-            if fmt == "table":
-                console.print("[dim]Loading reference model (adapter)...[/]")
-            ref_eval = make_hf_adapter_evaluator(str(adapter_path), resolved_base)
-            if fmt == "table":
-                console.print("[dim]Loading exported model...[/]")
-            exported_eval = make_hf_evaluator(str(exported_path))
-            if fmt == "table":
-                console.print("[green]All three models loaded.[/]\n")
+                console.print(
+                    f"[yellow]Model loading failed ({for_terminal(str(_probe_error))}); "
+                    "using deterministic stubs "
+                    "because --allow-stub was passed.  "
+                    "This does NOT verify real export fidelity and will fail the gate.[/]"
+                )
+            is_stub = True
 
+        # --- Build factories for sequential loading ---
+        from soup_cli.eval.export_check import (
+            FunctionModelEvaluator,
+            HFCausalLMEvaluator,
+            make_hf_adapter_evaluator,
+            make_hf_evaluator,
+            run_export_check_from_factories,
+        )
+
+        if is_stub:
+            # Stub path: factories return deterministic FunctionModelEvaluator stubs
+            def _base_factory_stub() -> FunctionModelEvaluator:
+                return FunctionModelEvaluator(stub_generator("base"))
+
+            def _ref_factory_stub() -> FunctionModelEvaluator:
+                return FunctionModelEvaluator(stub_generator("ref"))
+
+            def _exp_factory_stub() -> FunctionModelEvaluator:
+                return FunctionModelEvaluator(stub_generator("exported"))
+
+            base_factory = _base_factory_stub
+            ref_factory = _ref_factory_stub
+            exported_factory = _exp_factory_stub
+        else:
+            _resolved_base_cap = resolved_base
+            _adapter_path_str = str(adapter_path)
+            _exported_path_str = str(exported_path)
+            _fmt_cap = fmt
+            _console_cap = console
+
+            def _base_factory() -> HFCausalLMEvaluator:
+                if _fmt_cap == "table":
+                    _console_cap.print("[dim]Loading base model...[/]")
+                return make_hf_evaluator(_resolved_base_cap)
+
+            def _ref_factory() -> HFCausalLMEvaluator:
+                if _fmt_cap == "table":
+                    _console_cap.print("[dim]Loading reference model (adapter)...[/]")
+                return make_hf_adapter_evaluator(_adapter_path_str, _resolved_base_cap)
+
+            def _exp_factory() -> HFCausalLMEvaluator:
+                if _fmt_cap == "table":
+                    _console_cap.print("[dim]Loading exported model...[/]")
+                return make_hf_evaluator(_exported_path_str)
+
+            base_factory = _base_factory
+            ref_factory = _ref_factory
+            exported_factory = _exp_factory
+
+        # --- Run comparison (sequential: one model in memory at a time) ---
+        try:
+            result = run_export_check_from_factories(
+                base_factory=base_factory,
+                ref_factory=ref_factory,
+                exported_factory=exported_factory,
+                prompts=prompt_list,
+                min_agreement=min_agreement,
+                stub=is_stub,
+            )
         except (ImportError, OSError, ValueError, RuntimeError) as exc:
+            # Model loading failed inside a factory (e.g. missing weights, bad path).
             if not allow_stub:
                 console.print(
                     f"[red]Failed to load models: {for_terminal(str(exc))}\n"
@@ -226,6 +292,7 @@ def register(app: typer.Typer, console: Console) -> None:
                     "(stubs always fail; they do not verify real fidelity).[/]"
                 )
                 raise typer.Exit(EXIT_RUNTIME_ERROR) from exc
+            # Retry with stubs
             if fmt == "table":
                 console.print(
                     f"[yellow]Model loading failed ({for_terminal(str(exc))}); "
@@ -234,20 +301,23 @@ def register(app: typer.Typer, console: Console) -> None:
                     "This does NOT verify real export fidelity and will fail the gate.[/]"
                 )
             is_stub = True
-            base_eval = stub_generator("base")
-            ref_eval = stub_generator("ref")
-            exported_eval = stub_generator("exported")
-
-        # --- Run comparison ---
-        try:
-            result = run_export_check(
-                base_gen=base_eval,
-                ref_gen=ref_eval,
-                exported_gen=exported_eval,
-                prompts=prompt_list,
-                min_agreement=min_agreement,
-                stub=is_stub,
-            )
+            stub_base = FunctionModelEvaluator(stub_generator("base"))
+            stub_ref = FunctionModelEvaluator(stub_generator("ref"))
+            stub_exp = FunctionModelEvaluator(stub_generator("exported"))
+            try:
+                result = run_export_check_from_factories(
+                    base_factory=lambda: stub_base,
+                    ref_factory=lambda: stub_ref,
+                    exported_factory=lambda: stub_exp,
+                    prompts=prompt_list,
+                    min_agreement=min_agreement,
+                    stub=True,
+                )
+            except Exception as exc2:  # noqa: BLE001
+                console.print(
+                    f"[red]Export check failed unexpectedly: {for_terminal(str(exc2))}[/]"
+                )
+                raise typer.Exit(EXIT_RUNTIME_ERROR) from exc2
         except Exception as exc:  # noqa: BLE001
             console.print(
                 f"[red]Export check failed unexpectedly: {for_terminal(str(exc))}[/]"
