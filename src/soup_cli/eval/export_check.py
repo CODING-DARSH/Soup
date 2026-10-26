@@ -19,15 +19,15 @@ follows the adapter (delta preserved) or reverts to the base (delta
 lost).
 
 Verdict taxonomy (matching the Soup gate taxonomy):
-  PASS        — exported model matches the adapter on every active prompt,
-                at least one prompt is active, and overall agreement meets
-                the threshold.
-  DELTA_LOST  — on at least one prompt where the adapter changed the
-                output the exported model reverted to the base; exit 2.
-  LOW_AGREE   — agreement fell below ``min_agreement`` without a clean
-                delta-lost case; exit 2.
-  NO_EVIDENCE — none of the prompts exposed an adapter change, so fidelity
-                cannot be verified; exit 2.
+  PASS          — exported model matches the adapter on every active prompt,
+                  at least one prompt is active, and overall agreement meets
+                  the threshold.
+  DELTA_LOST    — on at least one prompt where the adapter changed the
+                  output the exported model reverted to the base; exit 2.
+  LOW_AGREEMENT — agreement fell below ``min_agreement`` without a clean
+                  delta-lost case; exit 2.
+  NO_EVIDENCE   — none of the prompts exposed an adapter change, so fidelity
+                  cannot be verified; exit 2.
 
 Only HuggingFace safetensors directories are supported for live
 generation.  Standalone GGUF files, MLX-fused directories, and other
@@ -625,10 +625,7 @@ def run_export_check_from_factories(
     base_outputs = [base_eval.generate(p) for p in effective_prompts]
     base_nll_val: Optional[float] = None
     if compute_nll and not stub:
-        try:
-            base_nll_val = base_eval.compute_nll(effective_prompts)
-        except Exception:  # noqa: BLE001
-            pass
+        base_nll_val = base_eval.compute_nll(effective_prompts)
     del base_eval
     gc.collect()
 
@@ -637,10 +634,7 @@ def run_export_check_from_factories(
     ref_outputs = [ref_eval.generate(p) for p in effective_prompts]
     ref_nll_val: Optional[float] = None
     if compute_nll and not stub:
-        try:
-            ref_nll_val = ref_eval.compute_nll(effective_prompts)
-        except Exception:  # noqa: BLE001
-            pass
+        ref_nll_val = ref_eval.compute_nll(effective_prompts)
     del ref_eval
     gc.collect()
 
@@ -649,10 +643,7 @@ def run_export_check_from_factories(
     exp_outputs = [exp_eval.generate(p) for p in effective_prompts]
     exp_nll_val: Optional[float] = None
     if compute_nll and not stub:
-        try:
-            exp_nll_val = exp_eval.compute_nll(effective_prompts)
-        except Exception:  # noqa: BLE001
-            pass
+        exp_nll_val = exp_eval.compute_nll(effective_prompts)
     del exp_eval
     gc.collect()
 
@@ -722,13 +713,9 @@ def run_export_check(
     ref_nll_val: Optional[float] = None
     exp_nll_val: Optional[float] = None
     if compute_nll and not stub:
-        try:
-            base_nll_val = base_eval.compute_nll(effective_prompts)
-            ref_nll_val = ref_eval.compute_nll(effective_prompts)
-            exp_nll_val = exp_eval.compute_nll(effective_prompts)
-        except Exception:  # noqa: BLE001
-            # If NLL computation is not supported by custom test generators, ignore
-            pass
+        base_nll_val = base_eval.compute_nll(effective_prompts)
+        ref_nll_val = ref_eval.compute_nll(effective_prompts)
+        exp_nll_val = exp_eval.compute_nll(effective_prompts)
 
     return _aggregate_rows_and_nll(
         prompts=effective_prompts,

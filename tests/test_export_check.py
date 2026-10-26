@@ -269,17 +269,27 @@ class TestRunExportCheck:
         assert _first_divergent_token([1, 2, 3], [1, 2]) == 2
 
     def test_weak_delta_caught_despite_high_character_agreement(self):
-        # Base: "a large city"
-        # Ref (adapter): "a big city"
-        # Exported: "a large city" (delta completely lost, reverted to base)
-        # Bigram overlap between "a large city" and "a big city" is relatively high (~0.6-0.8),
-        # but because exported is closer to base than to ref, it must be flagged as DELTA_LOST!
+        # Base: "The quick brown fox jumps over the lazy dog runs."
+        # Ref (adapter): "The quick brown fox leaps over the lazy dog runs."
+        # Exported: "The quick brown fox jumps over the lazy dog runs." (reverted to base)
+        # Bigram overlap between exported and ref is 0.857 (above min_agreement 0.80),
+        # but because exported is closer to base than to ref, the closer-to-base comparison
+        # alone must flag this as DELTA_LOST!
+        base_text = "The quick brown fox jumps over the lazy dog runs."
+        ref_text = "The quick brown fox leaps over the lazy dog runs."
+        exported_text = base_text
+
         result = run_export_check(
-            base_gen=lambda _p: "a large city",
-            ref_gen=lambda _p: "a big city",
-            exported_gen=lambda _p: "a large city",
-            prompts=["Describe New York:"],
+            base_gen=lambda _p: base_text,
+            ref_gen=lambda _p: ref_text,
+            exported_gen=lambda _p: exported_text,
+            prompts=["Describe fox action:"],
+            min_agreement=0.80,
         )
+        row = result.rows[0]
+        assert row.agree_export_ref > 0.80
+        assert round(row.agree_export_ref, 3) == 0.857
+        assert row.agree_export_base == 1.0
         assert result.delta_lost is True
         assert result.passed is False
         assert result.verdict == "DELTA_LOST"
@@ -331,6 +341,19 @@ class TestExportCheckCLI:
     def test_cli_missing_options_exits_usage_error(self):
         result = runner.invoke(app, ["eval", "export-check"])
         assert result.exit_code == EXIT_USAGE_ERROR
+
+    def test_cli_missing_prompts_exits_usage_error_with_guidance(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+
+        result = runner.invoke(app, [
+            "eval", "export-check",
+            "--adapter", str(adapter_dir),
+            "--exported", str(exported_dir),
+        ])
+        assert result.exit_code == EXIT_USAGE_ERROR
+        stripped = _strip_ansi(result.output)
+        assert "give --prompts" in stripped
 
     def test_cli_path_outside_cwd_exits_usage_error(self, tmp_path, monkeypatch):
         sub = tmp_path / "sub"
@@ -494,6 +517,34 @@ class TestExportCheckCLI:
             assert data["passed"] is False
             assert data["delta_lost"] is True
 
+    def test_cli_no_evidence_fails_gate_with_exit_2(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        adapter_dir, exported_dir = self._setup_dirs(tmp_path)
+        prompts = tmp_path / "prompts.txt"
+        prompts.write_text("prompt 1\n", encoding="utf-8")
+
+        with patch("soup_cli.eval.export_check.make_hf_evaluator") as mock_hf_eval, \
+             patch("soup_cli.eval.export_check.make_hf_adapter_evaluator") as mock_ref_eval:
+            # Base, ref, and export all produce the exact same output -> adapter is inactive
+            mock_hf_eval.side_effect = [
+                FunctionModelEvaluator(lambda _p: "identical response"),
+                FunctionModelEvaluator(lambda _p: "identical response"),
+            ]
+            mock_ref_eval.return_value = FunctionModelEvaluator(lambda _p: "identical response")
+
+            result = runner.invoke(app, [
+                "eval", "export-check",
+                "--adapter", str(adapter_dir),
+                "--exported", str(exported_dir),
+                "--prompts", str(prompts),
+                "--format", "json",
+            ])
+            assert result.exit_code == EXIT_GATE_FAILED
+            data = json.loads(result.output)
+            assert data["passed"] is False
+            assert data["verdict"] == "NO_EVIDENCE"
+            assert data["active_prompt_count"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Offline Tiny-Model Integration Tests (tests._tiny_hf_models)
@@ -626,3 +677,75 @@ class TestSequentialLoading:
         assert result.ref_nll == 0.5
         assert result.exported_nll == 0.5
         assert result.passed
+
+    def test_sequential_nll_closer_to_base_triggers_delta_lost(self):
+        """When outputs agree but exported NLL reverts closer to base than ref,
+        verdict is DELTA_LOST.
+
+        Scenario: base NLL = 1.0, ref NLL = 0.5, exported NLL = 0.95.
+        Generation outputs match reference (agreement = 1.0), but NLL delta was lost.
+        """
+        nll_map = {"base": 1.0, "ref": 0.5, "exp": 0.95}
+
+        def make_factory(label: str):
+            def factory():
+                # Base generates "base response", ref and exp generate "adapted response"
+                out = "base response" if label == "base" else "adapted response"
+                return FunctionModelEvaluator(
+                    lambda _p, o=out: o,
+                    nll_fn=lambda _texts, tag=label: nll_map[tag],
+                )
+            return factory
+
+        result = run_export_check_from_factories(
+            base_factory=make_factory("base"),
+            ref_factory=make_factory("ref"),
+            exported_factory=make_factory("exp"),
+            prompts=["prompt 1"],
+            min_agreement=0.80,
+        )
+        assert result.base_nll == 1.0
+        assert result.ref_nll == 0.5
+        assert result.exported_nll == 0.95
+        assert result.delta_lost is True
+        assert result.passed is False
+        assert result.verdict == "DELTA_LOST"
+
+    def test_sequential_evaluator_released_before_next_factory_runs(self):
+        """Verify that an evaluator is released before the next factory runs."""
+        import weakref
+
+        evaluator_refs: list[tuple[str, weakref.ReferenceType]] = []
+        liveness_at_next_call: list[tuple[str, bool]] = []
+
+        def make_tracked_factory(label: str):
+            def factory():
+                # Inspect whether any previously constructed evaluator is still alive
+                for prev_label, ref in evaluator_refs:
+                    is_alive = ref() is not None
+                    liveness_at_next_call.append((f"{prev_label}_alive_at_{label}", is_alive))
+                # Output matches ref output for exported to pass agreement
+                out = "base output" if label == "base" else "adapter output"
+                evaluator = FunctionModelEvaluator(lambda _p, o=out: o)
+                evaluator_refs.append((label, weakref.ref(evaluator)))
+                return evaluator
+            return factory
+
+        result = run_export_check_from_factories(
+            base_factory=make_tracked_factory("base"),
+            ref_factory=make_tracked_factory("ref"),
+            exported_factory=make_tracked_factory("exp"),
+            prompts=["prompt 1"],
+        )
+        assert result.passed
+
+        # Check recorded liveness:
+        # When ref_factory was invoked, base must already be released.
+        # When exp_factory was invoked, base and ref must both already be released.
+        assert ("base_alive_at_ref", False) in liveness_at_next_call
+        assert ("base_alive_at_exp", False) in liveness_at_next_call
+        assert ("ref_alive_at_exp", False) in liveness_at_next_call
+
+        # At the end of execution, all three evaluators must be completely dereferenced
+        for label, ref in evaluator_refs:
+            assert ref() is None, f"{label} evaluator was not released at end"
